@@ -18,11 +18,10 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 
 UTC = dt.timezone.utc
-SIGNALS = ['브랜드 신제품 출시', '브랜드 재입고 품절', '브랜드 펀딩',
-           '로컬 브랜드 후기', '마켓 참여 브랜드', '편집숍 신규 입점']
+SIGNALS = ['직접 구매 후기', '재구매 후기', '예약 구매 후기',
+           '작은 가게 방문 후기', '로컬마켓 구매 후기', '독립 브랜드 사용 후기']
 
 class Text(HTMLParser):
     def __init__(self):
@@ -80,37 +79,50 @@ def request(url, headers=None, body=None):
             else: delay = 2 ** attempt
             time.sleep(delay)
 
-def rss(query, days):
-    params = urllib.parse.urlencode({'q': f'{query} when:{days}d',
-                                     'hl': 'ko', 'gl': 'KR', 'ceid': 'KR:ko'})
-    return parse_rss(request('https://news.google.com/rss/search?' + params), query)
+def collection_error(exc):
+    value = str(exc)
+    return value if re.fullmatch(r'HTTP_\d+|retry_later|invalid_retry_after', value) else type(exc).__name__
 
-def parse_rss(raw, query):
-    rows = []
-    for item in ET.fromstring(raw).findall('.//item'):
-        source = item.find('source')
-        rows.append({'url': item.findtext('link') or '',
-                     'title': plain(item.findtext('title')),
-                     'text': plain(item.findtext('description')),
-                     'published_at': item.findtext('pubDate') or '',
-                     'publisher': plain(source.text) if source is not None else '',
-                     'channel': 'google_news_rss', 'query': query,
-                     'text_scope': 'title_and_feed_summary'})
-    return rows
 
-def naver(query, channel, limit):
-    params = urllib.parse.urlencode({'query': query, 'display': min(limit, 100),
-                                     'start': 1, 'sort': 'date'})
-    raw = request(f'https://openapi.naver.com/v1/search/{channel}.json?' + params,
-                  {'X-Naver-Client-Id': os.environ['NAVER_CLIENT_ID'],
-                   'X-Naver-Client-Secret': os.environ['NAVER_CLIENT_SECRET']})
-    result = json.loads(raw)
-    return [{'url': r.get('originallink') or r.get('link', ''),
-             'title': plain(r.get('title')), 'text': plain(r.get('description')),
-             'published_at': r.get('pubDate') or r.get('postdate', ''),
-             'publisher': plain(r.get('bloggername')) or urllib.parse.urlsplit(r.get('originallink', '')).netloc,
-             'channel': 'naver_' + channel, 'query': query,
-             'text_scope': 'title_and_search_snippet'} for r in result.get('items', [])]
+def naver(query, limit):
+    """Blog-only pagination; preserve previous pages on a later failure."""
+    rows = []; errors = []; requests = 0; seen_pages = set(); stop = 'requested_limit'
+    for start in range(1, min(limit, 1000) + 1, 100):
+        display = min(100, limit - len(rows))
+        params = urllib.parse.urlencode({'query': query, 'display': display,
+                                         'start': start, 'sort': 'date'})
+        requests += 1
+        try:
+            raw = request('https://openapi.naver.com/v1/search/blog.json?' + params,
+                          {'X-Naver-Client-Id': os.environ['NAVER_CLIENT_ID'],
+                           'X-Naver-Client-Secret': os.environ['NAVER_CLIENT_SECRET']})
+            result = json.loads(raw)
+            items = result.get('items', [])
+            if not isinstance(items, list): raise ValueError('invalid_items')
+            if not items:
+                stop = 'empty_page'; break
+            fingerprint = tuple(item.get('link', '') for item in items)
+            if fingerprint in seen_pages:
+                stop = 'repeated_page'; break
+            seen_pages.add(fingerprint)
+            page = [{'url': r.get('link', ''),
+                     'title': plain(r.get('title')), 'text': plain(r.get('description')),
+                     'published_at': r.get('postdate', ''),
+                     'publisher': plain(r.get('bloggername')),
+                     'channel': 'naver_blog', 'query': query,
+                     'text_scope': 'title_and_search_snippet'} for r in items[:display]]
+            rows.extend(page)
+            total = result.get('total')
+            if isinstance(total, int) and start + len(items) - 1 >= total:
+                stop = 'available_results_exhausted'; break
+            if len(items) < display:
+                stop = 'short_page'; break
+        except Exception as exc:
+            errors.append({'stage': 'collection', 'query': query, 'channel': 'naver_blog',
+                           'page_start': start, 'error': collection_error(exc)})
+            stop = 'page_error'; break
+    return rows, {'query': query, 'requested': limit, 'received': len(rows),
+                  'page_requests': requests, 'stop_reason': stop}, errors
 
 def normalize_name(name):
     return re.sub(r'[\W_]+', '', unicodedata.normalize('NFKC', name).casefold())
@@ -173,8 +185,10 @@ def validate_entities(entities, docs):
 
 def prepare(rows, days, cap):
     cutoff = dt.datetime.now(UTC) - dt.timedelta(days=days)
-    docs = {}; rejected = {'missing_url_or_title': 0, 'outside_window': 0, 'unknown_date': 0}
+    docs = {}; rejected = {'missing_url_or_title': 0, 'outside_window': 0, 'unknown_date': 0, 'excluded_source': 0}
     for row in rows:
+        if row.get('channel') != 'naver_blog':
+            rejected['excluded_source'] += 1; continue
         if not row.get('url') or not row.get('title'):
             rejected['missing_url_or_title'] += 1; continue
         published = date(row.get('published_at'))
@@ -238,7 +252,7 @@ def render(report):
 <title>퍼스트 웨이브 · 발견 실험</title><style>body{font:16px/1.7 system-ui,sans-serif;background:#f5f5f0;color:#172e29;max-width:950px;margin:40px auto;padding:0 20px}h1{font-size:36px}article{background:white;padding:24px;margin:20px 0;border:1px solid #dce2dd;border-radius:12px}small{display:block;color:#68716a}a{color:#146b50}blockquote{border-left:3px solid #c8dace;margin:12px 0;padding:0 16px}li{margin:18px 0}.notice{background:#e6eee7;padding:20px;border-radius:12px}</style>
 <h1>퍼스트 웨이브 · 발견 실험</h1><div class="notice">''' + e(
         f"주제: {', '.join(report['topics']) or '상품군 미지정'} | 확보 문서 {report['document_count']}건 | 이름 후보 {len(report['candidates'])}개 | 추출 방식 {report['extractor']}\n"
-        '새로 발견한 이름은 신생·상승 브랜드라는 뜻이 아닙니다. 검색 표본이며 시장 전체 순위가 아닙니다. 언론 재배포는 독립 소비자 반응이 아닙니다. 제목·요약에서 추출했으며 본문 전체를 확인하지 않았습니다.') + '</div><p>' + e(
+        '새로 발견한 이름은 신생·상승 브랜드라는 뜻이 아닙니다. 검색 표본이며 시장 전체 순위가 아닙니다. 블로그 광고·협찬 여부와 독립 소비자 반응은 추가 확인이 필요합니다. 제목·요약에서 추출했으며 본문 전체를 확인하지 않았습니다.') + '</div><p>' + e(
         '실행 오류: ' + str(len(report['errors'])) + '건. 상세 내용은 report.json을 확인하세요.') + '</p>' + (''.join(cards) or '<p>근거가 확인된 이름 후보가 없습니다.</p>') + '</html>'
 
 def main():
@@ -246,43 +260,32 @@ def main():
     p.add_argument('--topic', action='append', default=[], help='Repeat for arbitrary categories; not a brand seed list')
     p.add_argument('--query', action='append', default=[], help='Additional brand-agnostic discovery query')
     p.add_argument('--days', type=int, default=90)
-    p.add_argument('--source', choices=['auto', 'google', 'naver'], default='auto')
-    p.add_argument('--per-query', type=int, default=30)
-    p.add_argument('--max-documents', type=int, default=150)
+    p.add_argument('--source', choices=['auto', 'naver'], default='auto')
+    p.add_argument('--per-query', type=int, default=500, help='Blog results per query, paginated up to 1000')
+    p.add_argument('--max-documents', type=int, default=3000, help='Maximum documents after deduplication')
     p.add_argument('--extractor', choices=['rule', 'openai'], default='rule')
     p.add_argument('--model', default='gpt-4.1-mini')
     p.add_argument('--input', type=Path, help='Offline replay: previously exported documents.json')
     p.add_argument('--output', type=Path, default=Path('runs/latest'))
     p.add_argument('--db', type=Path, default=Path('state/discovery.sqlite'))
     args = p.parse_args()
-    if not 1 <= args.days <= 3650 or not 1 <= args.per_query <= 100 or not 1 <= args.max_documents <= 2000:
-        p.error('days: 1..3650, per-query: 1..100, max-documents: 1..2000')
+    if not 1 <= args.days <= 3650 or not 1 <= args.per_query <= 1000 or not 1 <= args.max_documents <= 20000:
+        p.error('days: 1..3650, per-query: 1..1000, max-documents: 1..20000')
     ready = bool(os.getenv('NAVER_CLIENT_ID') and os.getenv('NAVER_CLIENT_SECRET'))
-    if args.source == 'naver' and not ready and not args.input:
-        p.error('NAVER_CLIENT_ID and NAVER_CLIENT_SECRET must be configured in the environment; do not paste secrets into chat.')
+    if not ready and not args.input:
+        p.error('뉴스 수집은 제외됐습니다. 네이버 블로그 검색을 위해 NAVER_CLIENT_ID와 NAVER_CLIENT_SECRET을 실행환경 비밀 설정에 등록하세요. 키를 채팅에 보내지 마세요.')
     if args.extractor == 'openai' and not os.getenv('OPENAI_API_KEY'):
         p.error('OPENAI_API_KEY must be configured in the environment.')
     queries = list(dict.fromkeys([f'{topic} {s}'.strip() for topic in (args.topic or ['']) for s in SIGNALS] + args.query))
     if len(queries) > 60: p.error('At most 60 queries per run. Narrow topics or run separate bounded batches.')
-    errors = []; rows = []; source = 'offline' if args.input else args.source
+    errors = []; rows = []; collection_stats = []
+    source = 'offline' if args.input else 'naver_blog'
     if args.input:
         rows = json.loads(args.input.read_text())
     else:
-        if source == 'auto': source = 'naver' if ready else 'google'
-        jobs = [(q, ch) for q in queries for ch in (['blog', 'news'] if source == 'naver' else ['rss'])]
-        def collect(job):
-            q, ch = job
-            try:
-                results = naver(q, ch, args.per_query) if source == 'naver' else rss(q, args.days)
-                return results[:args.per_query], None
-            except Exception as exc:
-                # Never print request headers, tokens, or arbitrary response bodies.
-                code = str(exc) if re.fullmatch(r'HTTP_\d+|retry_later|invalid_retry_after', str(exc)) else type(exc).__name__
-                return [], {'stage': 'collection', 'query': q, 'channel': ch, 'error': code}
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            for result, error in pool.map(collect, jobs):
-                rows.extend(result)
-                if error: errors.append(error)
+            for result, stats, failures in pool.map(lambda q: naver(q, args.per_query), queries):
+                rows.extend(result); collection_stats.append(stats); errors.extend(failures)
     docs, rejected, truncated = prepare(rows, args.days, args.max_documents)
     pairs = []; rejected_entities = 0
     if args.extractor == 'rule':
@@ -300,6 +303,8 @@ def main():
               'queries': queries, 'source': source, 'extractor': args.extractor,
               'requested_days': args.days, 'raw_row_count': len(rows), 'document_count': len(docs),
               'date_rejections': rejected, 'document_cap_reached': truncated,
+              'collection_stats': collection_stats, 'per_query_limit': args.per_query,
+              'max_documents': args.max_documents,
               'rejected_ai_entities': rejected_entities, 'errors': errors, 'candidates': candidates,
               'limitations': ['Search samples, not platform-wide volume or growth rankings.',
                              'Publisher labels do not prove independent reporting or consumer demand.',
@@ -312,6 +317,6 @@ def main():
     (args.output / 'report.html').write_text(render(report), encoding='utf-8')
     print(json.dumps({'source': source, 'documents': len(docs), 'candidates': len(candidates),
                       'errors': len(errors), 'report': str(args.output / 'report.html')}, ensure_ascii=False))
-    return 2 if not docs or (args.extractor == 'openai' and any(e['stage'] == 'extraction' for e in errors)) else 0
+    return 2 if errors or not docs or (args.extractor == 'openai' and any(e['stage'] == 'extraction' for e in errors)) else 0
 
 if __name__ == '__main__': sys.exit(main())
